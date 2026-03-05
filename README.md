@@ -1,7 +1,14 @@
 # Emomni
 
-<a href='https://huggingface.co/Jotakak/Emomni-v1'><img src='https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Checkpoint-blue'></a>
+[![code](https://img.shields.io/badge/Github-Code-keygen.svg?logo=github)](https://github.com/Jotakak-yu/Emomni-v1) [![models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-Models-blue.svg)](https://huggingface.co/Jotakak/Emomni-v1)
 
+| Emomni-v1                                                             |
+| --------------------------------------------------------------------- |
+| 🤗 [Emomni-v1](https://huggingface.co/Jotakak/Emomni-v1) |
+| 🤗 [Emomni-v1-bnb-4bit](https://huggingface.co/Jotakak/Emomni-v1-bnb-4bit) |
+| 🤗 [Emomni-v1-small](https://huggingface.co/Jotakak/Emomni-v1-small) |
+| 🤗 [Emomni-v1-small-bnb-4bit](https://huggingface.co/Jotakak/Emomni-v1-small-bnb-4bit) |
+    
 ## Usage
 ```bash
 git clone https://github.com/Jotakak-yu/Emomni-v1.git
