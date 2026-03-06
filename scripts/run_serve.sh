@@ -294,6 +294,20 @@ done
 mkdir -p "$PID_DIR"
 mkdir -p "$PROJECT_DIR/logs/serve"
 
+is_valid_model_path() {
+    local path="$1"
+    # 1. 本地目录存在
+    if [ -d "$path" ]; then
+        return 0
+    fi
+    # 2. HuggingFace Hub repo_id: 格式为 "namespace/repo-name"
+    #    包含 / 但不以 / 或 . 开头，且不含空格
+    if [[ "$path" == *"/"* ]] && [[ "$path" != "/"* ]] && [[ "$path" != "./"* ]] && [[ "$path" != "../"* ]] && [[ "$path" != *" "* ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # ====== 停止所有服务 ======
 stop_all_services() {
     echo "=========================================="
@@ -412,8 +426,9 @@ if [ "$CONTROLLER_ONLY" = false ] && [ "$WEBUI_ONLY" = false ]; then
         exit 1
     fi
     # 单模型验证
-    if [ -n "$MODEL_PATH" ] && [ ! -d "$MODEL_PATH" ]; then
+    if [ -n "$MODEL_PATH" ] && ! is_valid_model_path "$MODEL_PATH"; then
         echo "错误: 模型路径不存在: $MODEL_PATH"
+        echo "提示: 支持本地路径或 HuggingFace Hub 格式 (如 owner/repo-name)"
         exit 1
     fi
 fi
@@ -437,8 +452,9 @@ fi
 # 验证多模型路径
 if [ -n "$MODELS" ]; then
     for mp in "${MODEL_ARRAY[@]}"; do
-        if [ ! -d "$mp" ]; then
+        if ! is_valid_model_path "$mp"; then
             echo "错误: 模型路径不存在: $mp"
+            echo "提示: 支持本地路径或 HuggingFace Hub 格式 (如 owner/repo-name)"
             exit 1
         fi
     done
