@@ -1,6 +1,6 @@
 # Emomni
 
-[![code](https://img.shields.io/badge/Github-Code-keygen.svg?logo=github)](https://github.com/Jotakak-yu/Emomni-v1) [![models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-Models-blue.svg)](https://huggingface.co/Jotakak/Emomni-v1)
+[![code](https://img.shields.io/badge/Github-Code-keygen.svg?logo=github)](https://github.com/Jotakak-yu/Emomni-v1) [![models](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging_Face-Models-blue.svg)](https://huggingface.co/Jotakak/Emomni-v1) [![arXiv](https://img.shields.io/badge/arXiv-uploading-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/xxxx.xxxxx)
 
 | Emomni-v1                                                             |
 | --------------------------------------------------------------------- |
