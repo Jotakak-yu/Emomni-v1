@@ -10,10 +10,10 @@ import json
 import time
 import threading
 import uuid
-from functools import partial
 from typing import List, Optional, Generator
 
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
+from starlette.concurrency import iterate_in_threadpool, run_in_threadpool
 from fastapi.responses import StreamingResponse
 import requests
 import torch
@@ -24,7 +24,7 @@ from transformers import (
     WhisperFeatureExtractor,
     GenerationConfig,
     TextIteratorStreamer,
-    BitsAndBytesConfig
+    BitsAndBytesConfig, StoppingCriteria, StoppingCriteriaList
 )
 
 from .constants import (
@@ -85,7 +85,7 @@ class ChatHistory:
         
         input_ids = self.im_start_tokens + self._tokenize_str("system", sys_prompt) + self.im_end_tokens
         input_ids = torch.LongTensor([input_ids])
-        # Fixed: use system_histroy to match chat_demo.py (typo preserved for compatibility)
+        # Preserve the existing history attribute name.
         self.system_histroy = [(input_ids,)]
         self.system_length = input_ids.shape[1]
 
@@ -129,9 +129,9 @@ class ChatHistory:
         self.audio_to_history = True
         
         # Import here to avoid circular imports
-        from src.instruction_dataset import get_waveform
+        from .audio import load_audio
         
-        speech = get_waveform(speech_path, output_sample_rate=self.extractor.sampling_rate)
+        speech = load_audio(speech_path, self.extractor.sampling_rate)
         speech_inputs = self.extractor(
             speech,
             sampling_rate=self.extractor.sampling_rate,
@@ -154,7 +154,7 @@ class ChatHistory:
         self.lengths.append(length)
         self.cur_length += length
 
-        # User turn end - match chat_demo.py exactly with [] + 
+        # User turn end
         input_ids = [] + self.im_end_tokens
         input_ids = torch.LongTensor([input_ids])
         self.history.append((input_ids,))
@@ -163,7 +163,7 @@ class ChatHistory:
     
     def get_history(self) -> List:
         """Get history with assistant prompt appended."""
-        # Match chat_demo.py exactly: encode "assistant" with default behavior
+        # Encode the assistant turn prefix.
         input_ids = self.nl_tokens + self.im_start_tokens + self.tokenizer.encode("assistant")
         input_ids = torch.LongTensor([input_ids])
         length = input_ids.shape[1]
@@ -208,6 +208,7 @@ class ModelWorker:
         bnb_4bit_quant_type: str = "nf4",
         bnb_4bit_use_double_quant: bool = True,
     ):
+        self.generation_lock = threading.Lock()
         self.controller_addr = controller_addr
         self.worker_addr = worker_addr
         self.worker_id = worker_id
@@ -298,7 +299,7 @@ class ModelWorker:
         self.model = EmomniModel.from_pretrained(model_path, **load_kwargs)
         
         # Only move to device if not using quantization (quantization handles device placement)
-        if not quantization_config:
+        if not getattr(self.model, "is_quantized", False):
             self.model = self.model.to(self.device)
         
         self.model.eval()
@@ -364,14 +365,14 @@ class ModelWorker:
 
     def _setup_generation_config(self):
         """Configure generation parameters with Qwen2.5/3 optimizations."""
-        # Calculate max_length based on max_window_size (matching chat_demo.py)
-        max_window_size = 6144  # Default from chat_demo.py
+        # Calculate max_length from the context window.
+        max_window_size = 6144
         
         config_updates = {
             "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
-            "min_new_tokens": 1,  # Add min_new_tokens like chat_demo.py
+            "min_new_tokens": 1,
             "temperature": DEFAULT_TEMPERATURE,
-            "max_length": max_window_size + DEFAULT_MAX_NEW_TOKENS,  # Like chat_demo.py
+            "max_length": max_window_size + DEFAULT_MAX_NEW_TOKENS,
             "top_p": DEFAULT_TOP_P,
             "do_sample": True,
             "num_return_sequences": 1,
@@ -467,9 +468,19 @@ class ModelWorker:
         )
 
     @torch.inference_mode()
-    def generate_stream(self, params: dict) -> Generator[bytes, None, None]:
-        """Generate response with streaming."""
+    def generate_stream(self, params: dict, cancelled=None) -> Generator[bytes, None, None]:
+        """Generate response with streaming; serialize access to mutable PLORA masks."""
+        cancelled = cancelled or threading.Event()
+        thread = None
+        acquired = False
+        errors = []
         try:
+            while not cancelled.is_set():
+                if self.generation_lock.acquire(timeout=0.1):
+                    acquired = True
+                    break
+            if not acquired or cancelled.is_set():
+                return
             # Extract parameters
             prompt = params.get("prompt", "")
             audio_path = params.get("audio_path")
@@ -481,13 +492,20 @@ class ModelWorker:
             # Create chat history
             history = self.create_chat_history(use_emotion)
             
-            # Process input
-            if audio_path:
-                history.add_audio(audio_path)
-                history.add_speech_history(audio_path, prompt)
-            else:
-                history.add_text_history("user", prompt)
-            
+            # Rebuild this request's complete history; no shared conversation state.
+            messages = params.get("messages")
+            if messages is None:
+                messages = [{"role": "user", "text": prompt, "audio_path": audio_path}]
+            for message in messages:
+                role, text = message["role"], message.get("text", "")
+                if role == "user" and message.get("audio_path"):
+                    history.add_audio(message["audio_path"])
+                    history.add_speech_history(message["audio_path"], text)
+                elif role in {"user", "assistant"}:
+                    history.add_text_history(role, text)
+                else:
+                    raise ValueError("Unsupported message role")
+
             # Update generation config
             gen_config = GenerationConfig(
                 max_new_tokens=max_new_tokens,
@@ -509,6 +527,11 @@ class ModelWorker:
             )
             
             # Start generation in background thread
+            class CancelCriteria(StoppingCriteria):
+                def __call__(self, input_ids, scores, **kwargs):
+                    return cancelled.is_set()
+
+            @torch.inference_mode()
             def generate_thread():
                 try:
                     self.model.chat(
@@ -516,9 +539,12 @@ class ModelWorker:
                         generation_config=gen_config,
                         device=self.device,
                         streamer=streamer,
+                        stopping_criteria=StoppingCriteriaList([CancelCriteria()]),
                     )
                 except Exception as e:
-                    logger.error(f"Generation error: {e}")
+                    errors.append(e)
+                    logger.exception("Generation error")
+                    streamer.end()
             
             thread = threading.Thread(target=generate_thread)
             thread.daemon = True
@@ -527,6 +553,8 @@ class ModelWorker:
             # Stream results
             generated_text = ""
             for new_text in streamer:
+                if cancelled.is_set():
+                    break
                 generated_text += new_text
                 yield json.dumps({
                     "text": generated_text,
@@ -534,6 +562,10 @@ class ModelWorker:
                     "finish_reason": None
                 }).encode() + b"\0"
             
+            if errors:
+                raise errors[0]
+            if cancelled.is_set():
+                return
             # Final response
             history.add_text_history("assistant", generated_text)
             yield json.dumps({
@@ -549,17 +581,12 @@ class ModelWorker:
                 "error_code": 1,
             }).encode() + b"\0"
 
-    def generate_stream_gate(self, params: dict) -> Generator[bytes, None, None]:
-        """Wrapper for generate_stream with error handling."""
-        try:
-            for x in self.generate_stream(params):
-                yield x
-        except Exception as e:
-            logger.exception(f"Stream generation error: {e}")
-            yield json.dumps({
-                "text": SERVER_ERROR_MSG,
-                "error_code": 1,
-            }).encode() + b"\0"
+        finally:
+            cancelled.set()
+            if thread is not None:
+                thread.join()
+            if acquired:
+                self.generation_lock.release()
 
 
 # ============================================================
@@ -571,34 +598,53 @@ worker: ModelWorker = None
 args = None
 
 
-def release_model_semaphore(fn=None):
-    """Release semaphore and optionally call a function."""
-    model_semaphore.release()
-    if fn is not None:
-        fn()
+# Events also cover requests queued behind the active generation.
+active_requests = {}
+
+
+@app.post("/worker_cancel")
+async def cancel_generation(request: Request):
+    request_id = (await request.json()).get("request_id")
+    event = active_requests.get(request_id)
+    if event is not None:
+        event.set()
+    return {"cancelled": event is not None}
 
 
 @app.post("/worker_generate_stream")
 async def generate_stream(request: Request):
-    """Handle streaming generation request."""
     global model_semaphore, global_counter
-    global_counter += 1
-    
     params = await request.json()
-    
+    request_id = params.get("request_id") or uuid.uuid4().hex
+    if not isinstance(request_id, str) or request_id in active_requests:
+        raise HTTPException(400, "Invalid or duplicate request_id")
+    event = threading.Event()
+    active_requests[request_id] = event
+    global_counter += 1
     if model_semaphore is None:
         model_semaphore = asyncio.Semaphore(args.limit_model_concurrency)
-    
-    await model_semaphore.acquire()
-    worker.send_heart_beat()
-    
-    generator = worker.generate_stream_gate(params)
-    background_tasks = BackgroundTasks()
-    background_tasks.add_task(
-        partial(release_model_semaphore, fn=worker.send_heart_beat)
-    )
-    
-    return StreamingResponse(generator, background=background_tasks)
+
+    async def stream():
+        generator = None
+        acquired = False
+        try:
+            await model_semaphore.acquire()
+            acquired = True
+            generator = worker.generate_stream(params, event)
+            async for chunk in iterate_in_threadpool(generator):
+                yield chunk
+        finally:
+            event.set()
+            # Wait for the model thread before accepting another PLORA mask.
+            if generator is not None:
+                import anyio
+                with anyio.CancelScope(shield=True):
+                    await run_in_threadpool(generator.close)
+            active_requests.pop(request_id, None)
+            if acquired:
+                model_semaphore.release()
+
+    return StreamingResponse(stream())
 
 
 @app.post("/worker_get_status")

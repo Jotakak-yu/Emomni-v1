@@ -60,7 +60,10 @@ class EmomniConfig(PretrainedConfig):
         # 规范化为AutoConfig对象并记录路径
         if isinstance(qwen_config, dict):
             qwen_config_clean = {k: v for k, v in qwen_config.items() if k != '_name_or_path'}
-            self.qwen_config = AutoConfig.from_pretrained(resolved_name_or_path, **qwen_config_clean)
+            # Published checkpoints already contain the complete base config.
+            self.qwen_config = (AutoConfig.for_model(**qwen_config)
+                                if qwen_config.get('model_type') else
+                                AutoConfig.from_pretrained(resolved_name_or_path, **qwen_config_clean))
         else:
             self.qwen_config = qwen_config
         self._name_or_path = resolved_name_or_path

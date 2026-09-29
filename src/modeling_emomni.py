@@ -534,6 +534,7 @@ class EmomniModel(PreTrainedModel):
         generation_config,
         device,
         streamer=None,
+        stopping_criteria=None,
     ):
         inputs_embeds = []
         lora_audio_mask = []
@@ -569,6 +570,7 @@ class EmomniModel(PreTrainedModel):
             attention_mask=attention_mask,
             generation_config=generation_config,
             streamer=streamer,
+            stopping_criteria=stopping_criteria,
         )
         return sequences, context_len
 
