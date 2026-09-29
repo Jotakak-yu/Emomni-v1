@@ -17,6 +17,5 @@ __all__ = [
     "DEFAULT_WORKER_PORT", 
     "DEFAULT_WEBUI_PORT",
     "DEFAULT_TTS_API_URL",
-    "TTS_VOICE_LIST",
     "SERVER_ERROR_MSG",
 ]
