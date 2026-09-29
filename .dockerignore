@@ -1,0 +1,12 @@
+.git
+.venv
+logs
+**/__pycache__
+**/.git
+**/pretrained_models
+**/checkpoints
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.safetensors
+**/*.bin

@@ -1,0 +1,32 @@
+services:
+  emomni:
+    build:
+      context: .
+      args:
+        TTS_MODE: ${TTS_MODE:-Kokoro}
+        MODEL_QUANTIZE: ${MODEL_QUANTIZE:-}
+    init: true
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-7860}:7860"
+    environment:
+      MODEL_SIZE: ${MODEL_SIZE:-base}
+      MODEL_QUANTIZE: ${MODEL_QUANTIZE:-}
+      TTS_MODE: ${TTS_MODE:-Kokoro}
+      TTS_GPU: "0"
+    volumes:
+      - model-cache:/cache
+      - serve-logs:/app/logs/serve
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_ID:-0}"]
+              capabilities: [gpu]
+    shm_size: 2gb
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  model-cache:
+  serve-logs:
