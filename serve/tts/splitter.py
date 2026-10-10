@@ -53,6 +53,8 @@ class SmartSplitter:
         cut = 0
         for end, strong in cuts:
             size = units(self.buffer[:end])
+            if size == 0:
+                continue
             if self.first:
                 ready = strong or size >= 8
             else:
