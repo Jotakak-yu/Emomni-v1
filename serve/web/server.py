@@ -768,12 +768,19 @@ class SafeStreamingBlocks(gr.Blocks):
         result = await super().handle_streaming_outputs(block_fn, data, session_hash, run,
                                                          root_path=root_path, final=final)
         streams = self.pending_streams.get(session_hash, {}).get(run, {})
-        for block in block_fn.outputs:
+        for index, block in enumerate(block_fn.outputs):
             stream = streams.get(block._id)
             if isinstance(block, gr.Audio) and block.streaming and stream and stream.segments:
                 # Gradio increases this with every chunk, delaying playlist polls.
                 # PCM chunks are bounded; derive the target from actual durations.
                 stream.max_duration = max(1, math.ceil(max(s["duration"] for s in stream.segments)))
+                # Keep the playlist metadata stable across text/replay updates.
+                # Gradio's client applies diffs in place; replacing it with skip
+                # before Svelte renders can erase a single short audio segment.
+                if result[index].get("is_stream"):
+                    stream.emomni_audio_output = dict(result[index])
+                elif result[index].get("__type__") == "update" and hasattr(stream, "emomni_audio_output"):
+                    result[index] = dict(stream.emomni_audio_output)
         return result
 
 
