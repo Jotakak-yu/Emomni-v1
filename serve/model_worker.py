@@ -7,9 +7,11 @@ Based on FastChat model worker architecture.
 import argparse
 import asyncio
 import json
+import os
 import time
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Generator
 
 from fastapi import FastAPI, Request, HTTPException
@@ -64,13 +66,15 @@ class ChatHistory:
         max_window_size: int = 6144,
         max_new_tokens: int = 512,
         use_emotion: bool = False,
-        speech_downsample_rate: int = 16
+        speech_downsample_rate: int = 16,
+        speech_loader=None,
     ):
         self.tokenizer = tokenizer
         self.extractor = extractor
         self.max_window_size = max_window_size
         self.max_new_tokens = max_new_tokens
         self.speech_downsample_rate = speech_downsample_rate
+        self.speech_loader = speech_loader
 
         # Special tokens
         self.im_start_tokens = tokenizer.convert_tokens_to_ids(["<|im_start|>"])
@@ -131,15 +135,17 @@ class ChatHistory:
         # Import here to avoid circular imports
         from .audio import load_audio
         
-        speech = load_audio(speech_path, self.extractor.sampling_rate)
-        speech_inputs = self.extractor(
-            speech,
-            sampling_rate=self.extractor.sampling_rate,
-            return_attention_mask=True,
-            return_tensors="pt"
-        )
-        speech_values = speech_inputs.input_features.to(torch.bfloat16)
-        speech_attention_mask = speech_inputs.attention_mask
+        if self.speech_loader is not None:
+            speech_segment = self.speech_loader(speech_path)
+            length = speech_segment[0].shape[1]
+        else:
+            speech = load_audio(speech_path, self.extractor.sampling_rate)
+            speech_inputs = self.extractor(speech, sampling_rate=self.extractor.sampling_rate,
+                                          return_attention_mask=True, return_tensors="pt")
+            speech_values = speech_inputs.input_features.to(torch.bfloat16)
+            speech_attention_mask = speech_inputs.attention_mask
+            speech_segment = (speech_values, speech_attention_mask)
+            length = speech_attention_mask.sum().item() // self.speech_downsample_rate
 
         # User turn start
         input_ids = self.nl_tokens + self.im_start_tokens + self._tokenize_str("user", text)
@@ -149,8 +155,7 @@ class ChatHistory:
         self.cur_length += input_ids.shape[1]
 
         # Speech features
-        self.history.append((speech_values, speech_attention_mask))
-        length = speech_attention_mask.sum().item() // self.speech_downsample_rate
+        self.history.append(speech_segment)
         self.lengths.append(length)
         self.cur_length += length
 
@@ -225,6 +230,7 @@ class ModelWorker:
         # Load model
         logger.info(f"Loading model from: {model_path}")
         self._load_model(model_path, qwen_model)
+        self.generation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="emomni-decode") if self.runtime else None
         
         # Create display name (last two path components)
         self.model_name = get_model_display_name(model_path)
@@ -303,6 +309,19 @@ class ModelWorker:
             self.model = self.model.to(self.device)
         
         self.model.eval()
+        self.runtime = None
+        if (os.getenv("EMOMNI_INFERENCE_OPTIMIZATIONS", "1") == "1"
+                and not getattr(self.model, "is_quantized", False)
+                and self.model.config.lora_scope == "global"
+                and self.model.qwen_config.model_type == "qwen2"):
+            if self.model.config.lora_config:
+                self.model.merge_lora()
+            self.model.qwen_model.set_attn_implementation("sdpa")
+            from .inference_runtime import InferenceRuntime
+            self.runtime = InferenceRuntime(self.model, self.extractor, self.device)
+            logger.info("Global BF16 inference: merged, SDPA, audio/prefix cache; decode compile=%s",
+                        self.runtime.compile_enabled)
+
         
         # Log memory usage
         if hasattr(self.model, 'get_memory_footprint'):
@@ -464,7 +483,8 @@ class ModelWorker:
             self.extractor,
             max_window_size=getattr(self.generation_config, "max_length", 6144),
             max_new_tokens=getattr(self.generation_config, "max_new_tokens", 512),
-            use_emotion=use_emotion
+            use_emotion=use_emotion,
+            speech_loader=self.runtime.speech if self.runtime else None,
         )
 
     @torch.inference_mode()
@@ -489,6 +509,8 @@ class ModelWorker:
             max_new_tokens = int(params.get("max_new_tokens", DEFAULT_MAX_NEW_TOKENS))
             use_emotion = params.get("use_emotion", self.use_emotion)
             
+            if self.runtime:
+                self.runtime.begin(params.get("session_id"))
             # Create chat history
             history = self.create_chat_history(use_emotion)
             
@@ -534,21 +556,24 @@ class ModelWorker:
             @torch.inference_mode()
             def generate_thread():
                 try:
-                    self.model.chat(
-                        history=history.get_history(),
-                        generation_config=gen_config,
-                        device=self.device,
-                        streamer=streamer,
-                        stopping_criteria=StoppingCriteriaList([CancelCriteria()]),
-                    )
+                    options = dict(history=history.get_history(), generation_config=gen_config,
+                                   streamer=streamer, stopping_criteria=StoppingCriteriaList([CancelCriteria()]))
+                    if self.runtime:
+                        self.runtime.chat(**options)
+                    else:
+                        self.model.chat(device=self.device, **options)
                 except Exception as e:
                     errors.append(e)
                     logger.exception("Generation error")
                     streamer.end()
             
-            thread = threading.Thread(target=generate_thread)
-            thread.daemon = True
-            thread.start()
+            if self.generation_executor:
+                # CUDA Graph state is thread-local; keep decode on one persistent
+                # thread across requests and cache-length buckets.
+                thread = self.generation_executor.submit(generate_thread)
+            else:
+                thread = threading.Thread(target=generate_thread, daemon=True)
+                thread.start()
             
             # Stream results
             generated_text = ""
@@ -582,10 +607,16 @@ class ModelWorker:
             }).encode() + b"\0"
 
         finally:
+            interrupted = cancelled.is_set() or bool(errors)
             cancelled.set()
             if thread is not None:
-                thread.join()
+                if self.generation_executor:
+                    thread.result()
+                else:
+                    thread.join()
             if acquired:
+                if interrupted and self.runtime:
+                    self.runtime.clear()
                 self.generation_lock.release()
 
 

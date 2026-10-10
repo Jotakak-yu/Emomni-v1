@@ -300,7 +300,7 @@ def _cancel_run(state, expected_id=None):
     # Cancellation must reach the model even if the HTTP stream is stalled.
     def cancel_backend():
         try:
-            requests.post(run["worker"] + "/worker_cancel", json={"request_id": run["id"]}, timeout=3)
+            requests.post(run["worker"] + "/worker_cancel", json={"request_id": run["id"], "session_id": state.session_id}, timeout=3)
         except requests.RequestException:
             logger.warning("Worker cancellation unavailable")
         response = run.get("response")
@@ -465,7 +465,7 @@ def _request_tts_manager(enabled, role, speed, split_mode, mode, ref_audio, ref_
     if mode == "Kokoro" and role not in KOKORO_VOICES:
         role = KOKORO_DEFAULT_VOICE
     return TTSManager(enabled=enabled, role=role, speed=speed,
-                      split_mode=split_mode or "punctuation", api_url=tts_manager.api_url,
+                      split_mode=split_mode or "smart", api_url=tts_manager.api_url,
                       tts_mode=mode, clone_ref_audio=ref_audio, clone_ref_text=ref_text or "")
 
 
@@ -551,7 +551,7 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, use_emot
     payload = {"model": model_selector, "messages": messages, "prompt": latest_user.get("text", ""),
                "audio_path": latest_user.get("audio_path") or None, "temperature": float(temperature),
                "top_p": float(top_p), "max_new_tokens": int(max_new_tokens), "use_emotion": use_emotion,
-               "request_id": run["id"]}
+               "request_id": run["id"], "session_id": state.session_id}
     text_queue = queue.Queue(maxsize=4096)
     segments = []
     generated_text = ""
@@ -565,7 +565,12 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, use_emot
     started = time.monotonic()
 
     def update(audio=None, replay=None, done=False):
-        return (state, state.to_chatbot_format()) + _buttons(running=not done) + (
+        if run["cancelled"].is_set() or state.turn_id != run["id"]:
+            return (gr.skip(),) * 8
+        # add_text owns the running transition. A delayed text/audio packet must
+        # never hide Send again after the Stop callback has restored it.
+        buttons = _buttons(running=False) if done else (gr.skip(),) * 4
+        return (state, state.to_chatbot_format()) + buttons + (
             audio if audio is not None else gr.skip(), replay if replay is not None else gr.skip())
 
     def take_audio():
@@ -585,7 +590,7 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, use_emot
             manager.stop_streaming_tts()
 
     try:
-        yield (state, state.to_chatbot_format()) + _buttons(running=True) + (gr.update(value=None, autoplay=True), None)
+        yield (state, state.to_chatbot_format()) + (gr.skip(),) * 4 + (gr.update(value=None, autoplay=True), None)
         if enable_tts:
             manager.start_streaming_tts(text_queue)
         with requests.post(worker + "/worker_generate_stream", headers=headers, json=payload,
@@ -738,7 +743,15 @@ def _hero(lang):
     return f'# {t["title"]}\n{t["subtitle"]}'
 
 
-PAUSE_AUDIO_JS = """() => {document.querySelectorAll('#tts_audio_output audio, #tts_replay audio').forEach(a => a.pause());}"""
+PAUSE_AUDIO_JS = """() => {
+  const pause = root => {
+    if (!root) return;
+    root.querySelectorAll('audio').forEach(a => a.pause());
+    root.querySelectorAll('*').forEach(e => { if (e.shadowRoot) pause(e.shadowRoot); });
+  };
+  pause(document.querySelector('#tts_audio_output'));
+  pause(document.querySelector('#tts_replay'));
+}"""
 
 
 class SafeStreamingBlocks(gr.Blocks):
@@ -793,8 +806,8 @@ def build_demo(controller_url: str, concurrency_count: int = 10, default_tts_mod
                         clone_audio = gr.Audio(type="filepath", sources=["upload", "microphone"], label=t["clone_ref_audio"])
                         clone_text = gr.Textbox(label=t["clone_ref_text"], placeholder=t["clone_ref_text_placeholder"])
                     tts_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.1, label=t["tts_speed"])
-                    split_mode = gr.Radio([(t["split_punctuation"], "punctuation"), (t["split_fast"], "fast")],
-                                           value="punctuation", label=t["tts_split_mode"])
+                    split_mode = gr.Radio([(t["split_smart"], "smart"), (t["split_punctuation"], "punctuation"), (t["split_fast"], "fast")],
+                                           value="smart", label=t["tts_split_mode"])
                 with gr.Accordion(t["gen_settings"], open=False) as gen_accordion:
                     temperature = gr.Slider(0, 1.5, value=DEFAULT_TEMPERATURE, step=0.1, label=t["temperature"])
                     top_p = gr.Slider(0.05, 1, value=DEFAULT_TOP_P, step=0.05, label=t["top_p"])
@@ -846,7 +859,7 @@ def build_demo(controller_url: str, concurrency_count: int = 10, default_tts_mod
                     tr["clone_settings_title"], gr.update(label=tr["clone_ref_audio"]),
                     gr.update(label=tr["clone_ref_text"], placeholder=tr["clone_ref_text_placeholder"]),
                     gr.update(label=tr["tts_speed"]),
-                    gr.update(label=tr["tts_split_mode"], choices=[(tr["split_punctuation"], "punctuation"), (tr["split_fast"], "fast")]),
+                    gr.update(label=tr["tts_split_mode"], choices=[(tr["split_smart"], "smart"), (tr["split_punctuation"], "punctuation"), (tr["split_fast"], "fast")]),
                     gr.update(label=tr["gen_settings"]), gr.update(label=tr["temperature"]), gr.update(label=tr["top_p"]),
                     gr.update(label=tr["max_new_tokens"]), gr.update(label=tr["chat"]),
                     gr.update(placeholder=tr["input_placeholder"], label=tr["chat"]), tr["input_hint"],

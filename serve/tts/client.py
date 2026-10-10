@@ -4,12 +4,14 @@ import os
 import queue
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import List, Tuple
 import requests
 import numpy as np
 import soundfile as sf
+from .splitter import SmartSplitter
 from ..constants import LOGDIR, DEFAULT_TTS_API_URL, DEFAULT_TTS_ROLE, TTS_MODES, KOKORO_DEFAULT_VOICE, KOKORO_VOICES
 logger = logging.getLogger(__name__)
 
@@ -23,7 +25,7 @@ class TTSManager:
         self,
         enabled: bool = True,
         role: str = DEFAULT_TTS_ROLE,
-        split_mode: str = "punctuation",
+        split_mode: str = "smart",
         speed: float = 1.0,
         api_url: str = DEFAULT_TTS_API_URL,
         tts_mode: str = TTS_MODES[0],
@@ -120,7 +122,8 @@ class TTSManager:
                 if self.stop_signal:
                     return
                 if not streaming:
-                    yield self._save_audio(response.content)
+                    path = self._save_audio(response.content)
+                    yield path
                     return
                 rate = int(response.headers.get("X-Audio-Sample-Rate", 24000))
                 pending = bytearray()
@@ -156,23 +159,49 @@ class TTSManager:
 
         def _tts_worker():
             buffer = ""
+            splitter = SmartSplitter() if self.split_mode == "smart" else None
+            final = False
+            audio_seconds = 0.0
+            first_audio_at = None
             try:
                 while not self.stop_signal:
-                    try:
-                        text_chunk = text_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        continue
-                    if text_chunk is None:
-                        sentences, buffer = ([buffer] if buffer.strip() else []), ""
+                    incoming = ""
+                    if not final:
+                        try:
+                            item = text_queue.get(timeout=0.04)
+                            if item is None:
+                                final = True
+                            else:
+                                incoming += item
+                            if splitter:
+                                # Synthesis may have buffered several clauses. Schedule
+                                # them together instead of replaying stale tiny fragments.
+                                while not final:
+                                    try:
+                                        item = text_queue.get_nowait()
+                                    except queue.Empty:
+                                        break
+                                    if item is None:
+                                        final = True
+                                    else:
+                                        incoming += item
+                        except queue.Empty:
+                            pass
+                    if splitter:
+                        ahead = max(0, audio_seconds - (time.monotonic() - first_audio_at)) if first_audio_at else 0
+                        sentences = splitter.feed(incoming, final=final, audio_ahead=ahead)
+                        buffer = splitter.buffer
                     else:
-                        buffer += text_chunk
-                        sentences, buffer = self.split_sentences(buffer, self.split_mode)
-                        # Bound unpunctuated input without losing whitespace between streamed chunks.
-                        while len(buffer) > 240:
-                            split_at = buffer.rfind(" ", 0, 240)
-                            split_at = split_at if split_at > 80 else 240
-                            sentences.append(buffer[:split_at])
-                            buffer = buffer[split_at:]
+                        buffer += incoming
+                        if final:
+                            sentences, buffer = ([buffer] if buffer.strip() else []), ""
+                        else:
+                            sentences, buffer = self.split_sentences(buffer, self.split_mode)
+                            while len(buffer) > 240:
+                                split_at = buffer.rfind(" ", 0, 240)
+                                split_at = split_at if split_at > 80 else 240
+                                sentences.append(buffer[:split_at])
+                                buffer = buffer[split_at:]
                     for sentence in sentences:
                         if self.stop_signal:
                             break
@@ -182,13 +211,16 @@ class TTSManager:
                             if self.stop_signal:
                                 Path(audio_path).unlink(missing_ok=True)
                                 continue
+                            if first_audio_at is None:
+                                first_audio_at = time.monotonic()
+                            audio_seconds += sf.info(audio_path).duration
                             try:
                                 self.audio_queue.put_nowait(audio_path)
                             except queue.Full:
                                 self.errors.append("tts_backlog")
                                 self.stop_streaming_tts()
                                 Path(audio_path).unlink(missing_ok=True)
-                    if text_chunk is None:
+                    if final and not buffer:
                         break
             except Exception as exc:
                 if not self.stop_signal:

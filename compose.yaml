@@ -13,6 +13,8 @@ services:
       MODEL_QUANTIZE: ${MODEL_QUANTIZE:-}
       TTS_MODE: ${TTS_MODE:-Kokoro}
       TTS_GPU: "0"
+      EMOMNI_DECODE_COMPILE: ${EMOMNI_DECODE_COMPILE:-0}
+      CV3_TF32: ${CV3_TF32:-0}
     volumes:
       - model-cache:/cache
       - serve-logs:/app/logs/serve
