@@ -112,6 +112,9 @@ class CosyVoice3Backend:
 
     def __init__(self):
         from huggingface_hub import snapshot_download
+        if os.getenv("CV3_TF32", "0") == "1":
+            import torch
+            torch.set_float32_matmul_precision("high")
 
         sys.path[:0] = [str(SOURCE), str(SOURCE / "third_party/Matcha-TTS")]
         from cosyvoice.cli import cosyvoice
@@ -154,7 +157,9 @@ class CosyVoice3Backend:
             except Exception as exc:
                 self.generation_error = exc
             finally:
-                self.model.model.llm_end_dict[args[-1]] = True
+                with self.model.model.token_condition:
+                    self.model.model.llm_end_dict[args[-1]] = True
+                    self.model.model.token_condition.notify_all()
 
         self.model.model.llm_job = llm_job
         self.sample_rate = self.model.sample_rate
